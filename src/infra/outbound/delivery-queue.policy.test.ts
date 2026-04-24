@@ -9,13 +9,14 @@ describe("delivery-queue policy", () => {
   describe("isPermanentDeliveryError", () => {
     it.each([
       "No conversation reference found for user:abc",
-      "Telegram send failed: chat not found (chat_id=user:123)",
+      "Forum send failed: chat not found (chat_id=user:123)",
       "403: Forbidden: bot is not a member of the channel chat",
       "user not found",
       "Bot was blocked by the user",
       "Forbidden: bot was kicked from the group chat",
       "chat_id is empty",
       "Outbound not configured for channel: demo-channel",
+      "MatrixError: [403] User @bot:matrix.example.com not in room !mixedCase:matrix.example.com",
     ])("returns true for permanent error: %s", (msg) => {
       expect(isPermanentDeliveryError(msg)).toBe(true);
     });

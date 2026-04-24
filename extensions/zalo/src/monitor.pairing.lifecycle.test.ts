@@ -1,22 +1,24 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { withServer } from "../../../test/helpers/http-test-server.js";
 import {
   createLifecycleMonitorSetup,
   createTextUpdate,
   postWebhookReplay,
-  resetLifecycleTestState,
-  setLifecycleRuntimeCore,
-  sendMessageMock,
   settleAsyncWork,
+} from "../test-support/lifecycle-test-support.js";
+import {
+  resetLifecycleTestState,
+  sendMessageMock,
+  setLifecycleRuntimeCore,
   startWebhookLifecycleMonitor,
-} from "../../../test/helpers/plugins/zalo-lifecycle.js";
+} from "../test-support/monitor-mocks-test-support.js";
 
 describe("Zalo pairing lifecycle", () => {
   const readAllowFromStoreMock = vi.fn(async () => [] as string[]);
   const upsertPairingRequestMock = vi.fn(async () => ({ code: "PAIRCODE", created: true }));
 
-  beforeEach(() => {
-    resetLifecycleTestState();
+  beforeEach(async () => {
+    await resetLifecycleTestState();
     setLifecycleRuntimeCore({
       pairing: {
         readAllowFromStore: readAllowFromStoreMock,
@@ -29,8 +31,8 @@ describe("Zalo pairing lifecycle", () => {
     });
   });
 
-  afterEach(() => {
-    resetLifecycleTestState();
+  afterAll(async () => {
+    await resetLifecycleTestState();
   });
 
   function createPairingMonitorSetup() {
@@ -42,7 +44,10 @@ describe("Zalo pairing lifecycle", () => {
   }
 
   it("emits one pairing reply across duplicate webhook replay and scopes reads and writes to accountId", async () => {
-    const monitor = await startWebhookLifecycleMonitor(createPairingMonitorSetup());
+    const monitor = await startWebhookLifecycleMonitor({
+      ...createPairingMonitorSetup(),
+      cacheKey: "zalo-pairing-lifecycle",
+    });
 
     try {
       await withServer(
@@ -98,7 +103,10 @@ describe("Zalo pairing lifecycle", () => {
   it("does not emit a second pairing reply when replay arrives after the first send fails", async () => {
     sendMessageMock.mockRejectedValueOnce(new Error("pairing send failed"));
 
-    const monitor = await startWebhookLifecycleMonitor(createPairingMonitorSetup());
+    const monitor = await startWebhookLifecycleMonitor({
+      ...createPairingMonitorSetup(),
+      cacheKey: "zalo-pairing-lifecycle",
+    });
 
     try {
       await withServer(

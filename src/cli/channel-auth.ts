@@ -5,12 +5,21 @@ import {
   normalizeChannelId,
 } from "../channels/plugins/index.js";
 import { resolveInstallableChannelPlugin } from "../commands/channel-setup/channel-plugin-resolution.js";
-import { loadConfig, writeConfigFile, type OpenClawConfig } from "../config/config.js";
+import {
+  loadConfig,
+  readConfigFileSnapshot,
+  replaceConfigFile,
+  type OpenClawConfig,
+} from "../config/config.js";
 import { applyPluginAutoEnable } from "../config/plugin-auto-enable.js";
+import { callGateway } from "../gateway/call.js";
 import { setVerbose } from "../globals.js";
+import { formatErrorMessage } from "../infra/errors.js";
 import { isBlockedObjectKey } from "../infra/prototype-keys.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
+import { normalizeOptionalString } from "../shared/string-coerce.js";
 import { sanitizeForLog } from "../terminal/ansi.js";
+import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
 
 type ChannelAuthOptions = {
   channel?: string;
@@ -123,14 +132,51 @@ function resolveAccountContext(
   opts: ChannelAuthOptions,
   cfg: OpenClawConfig,
 ) {
-  const accountId = opts.account?.trim() || resolveChannelDefaultAccountId({ plugin, cfg });
+  const accountId =
+    normalizeOptionalString(opts.account) || resolveChannelDefaultAccountId({ plugin, cfg });
   return { accountId };
+}
+
+async function reconcileGatewayRuntimeAfterLocalLogin(params: {
+  cfg: OpenClawConfig;
+  plugin: ChannelPlugin;
+  channelId: string;
+  accountId: string;
+  runtime: RuntimeEnv;
+}) {
+  if (!params.plugin.gateway?.startAccount) {
+    return;
+  }
+  if (params.cfg.gateway?.mode === "remote") {
+    params.runtime.log(
+      `Gateway is in remote mode; local login saved auth for ${params.channelId}/${params.accountId} but did not start the remote runtime.`,
+    );
+    return;
+  }
+  try {
+    await callGateway({
+      config: params.cfg,
+      method: "channels.start",
+      params: {
+        channel: params.channelId,
+        accountId: params.accountId,
+      },
+      mode: GATEWAY_CLIENT_MODES.BACKEND,
+      clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
+      deviceIdentity: null,
+    });
+  } catch (error) {
+    params.runtime.log(
+      `Local login saved auth for ${params.channelId}/${params.accountId}, but the running gateway did not restart it: ${formatErrorMessage(error)}`,
+    );
+  }
 }
 
 export async function runChannelLogin(
   opts: ChannelAuthOptions,
   runtime: RuntimeEnv = defaultRuntime,
 ) {
+  const sourceSnapshotPromise = readConfigFileSnapshot().catch(() => null);
   const autoEnabled = applyPluginAutoEnable({
     config: loadConfig(),
     env: process.env,
@@ -143,7 +189,10 @@ export async function runChannelLogin(
     runtime,
   );
   if (autoEnabled.changes.length > 0 || configChanged) {
-    await writeConfigFile(cfg);
+    await replaceConfigFile({
+      nextConfig: cfg,
+      baseHash: (await sourceSnapshotPromise)?.hash,
+    });
   }
   const login = plugin.auth?.login;
   if (!login) {
@@ -159,12 +208,20 @@ export async function runChannelLogin(
     verbose: Boolean(opts.verbose),
     channelInput,
   });
+  await reconcileGatewayRuntimeAfterLocalLogin({
+    cfg,
+    plugin,
+    channelId: plugin.id,
+    accountId,
+    runtime,
+  });
 }
 
 export async function runChannelLogout(
   opts: ChannelAuthOptions,
   runtime: RuntimeEnv = defaultRuntime,
 ) {
+  const sourceSnapshotPromise = readConfigFileSnapshot().catch(() => null);
   const autoEnabled = applyPluginAutoEnable({
     config: loadConfig(),
     env: process.env,
@@ -177,7 +234,10 @@ export async function runChannelLogout(
     runtime,
   );
   if (autoEnabled.changes.length > 0 || configChanged) {
-    await writeConfigFile(cfg);
+    await replaceConfigFile({
+      nextConfig: cfg,
+      baseHash: (await sourceSnapshotPromise)?.hash,
+    });
   }
   const logoutAccount = plugin.gateway?.logoutAccount;
   if (!logoutAccount) {

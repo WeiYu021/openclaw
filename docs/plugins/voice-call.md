@@ -3,7 +3,7 @@ summary: "Voice Call plugin: outbound + inbound calls via Twilio/Telnyx/Plivo (p
 read_when:
   - You want to place an outbound voice call from OpenClaw
   - You are configuring or developing the voice-call plugin
-title: "Voice Call Plugin"
+title: "Voice call plugin"
 ---
 
 # Voice Call (plugin)
@@ -63,7 +63,7 @@ Set config under `plugins.entries.voice-call.config`:
         enabled: true,
         config: {
           provider: "twilio", // or "telnyx" | "plivo" | "mock"
-          fromNumber: "+15550001234",
+          fromNumber: "+15550001234", // or TWILIO_FROM_NUMBER for Twilio
           toNumber: "+15550005678",
 
           twilio: {
@@ -107,11 +107,31 @@ Set config under `plugins.entries.voice-call.config`:
 
           streaming: {
             enabled: true,
+            provider: "openai", // optional; first registered realtime transcription provider when unset
             streamPath: "/voice/stream",
+            providers: {
+              openai: {
+                apiKey: "sk-...", // optional if OPENAI_API_KEY is set
+                model: "gpt-4o-transcribe",
+                silenceDurationMs: 800,
+                vadThreshold: 0.5,
+              },
+            },
             preStartTimeoutMs: 5000,
             maxPendingConnections: 32,
             maxPendingConnectionsPerIp: 4,
             maxConnections: 128,
+          },
+
+          realtime: {
+            enabled: false,
+            provider: "google", // optional; first registered realtime voice provider when unset
+            providers: {
+              google: {
+                model: "gemini-2.5-flash-native-audio-preview-12-2025",
+                voice: "Kore",
+              },
+            },
           },
         },
       },
@@ -125,16 +145,197 @@ Notes:
 - Twilio/Telnyx require a **publicly reachable** webhook URL.
 - Plivo requires a **publicly reachable** webhook URL.
 - `mock` is a local dev provider (no network calls).
+- If older configs still use `provider: "log"`, `twilio.from`, or legacy `streaming.*` OpenAI keys, run `openclaw doctor --fix` to rewrite them.
 - Telnyx requires `telnyx.publicKey` (or `TELNYX_PUBLIC_KEY`) unless `skipSignatureVerification` is true.
 - `skipSignatureVerification` is for local testing only.
 - If you use ngrok free tier, set `publicUrl` to the exact ngrok URL; signature verification is always enforced.
 - `tunnel.allowNgrokFreeTierLoopbackBypass: true` allows Twilio webhooks with invalid signatures **only** when `tunnel.provider="ngrok"` and `serve.bind` is loopback (ngrok local agent). Use for local dev only.
 - Ngrok free tier URLs can change or add interstitial behavior; if `publicUrl` drifts, Twilio signatures will fail. For production, prefer a stable domain or Tailscale funnel.
+- `realtime.enabled` starts full voice-to-voice conversations; do not enable it together with `streaming.enabled`.
 - Streaming security defaults:
   - `streaming.preStartTimeoutMs` closes sockets that never send a valid `start` frame.
-  - `streaming.maxPendingConnections` caps total unauthenticated pre-start sockets.
-  - `streaming.maxPendingConnectionsPerIp` caps unauthenticated pre-start sockets per source IP.
-  - `streaming.maxConnections` caps total open media stream sockets (pending + active).
+- `streaming.maxPendingConnections` caps total unauthenticated pre-start sockets.
+- `streaming.maxPendingConnectionsPerIp` caps unauthenticated pre-start sockets per source IP.
+- `streaming.maxConnections` caps total open media stream sockets (pending + active).
+- Runtime fallback still accepts those old voice-call keys for now, but the rewrite path is `openclaw doctor --fix` and the compat shim is temporary.
+
+## Realtime voice conversations
+
+`realtime` selects a full duplex realtime voice provider for live call audio.
+It is separate from `streaming`, which only forwards audio to realtime
+transcription providers.
+
+Current runtime behavior:
+
+- `realtime.enabled` is supported for Twilio Media Streams.
+- `realtime.enabled` cannot be combined with `streaming.enabled`.
+- `realtime.provider` is optional. If unset, Voice Call uses the first
+  registered realtime voice provider.
+- Bundled realtime voice providers include Google Gemini Live (`google`) and
+  OpenAI (`openai`), registered by their provider plugins.
+- Provider-owned raw config lives under `realtime.providers.<providerId>`.
+- If `realtime.provider` points at an unregistered provider, or no realtime
+  voice provider is registered at all, Voice Call logs a warning and skips
+  realtime media instead of failing the whole plugin.
+
+Google Gemini Live realtime defaults:
+
+- API key: `realtime.providers.google.apiKey`, `GEMINI_API_KEY`, or
+  `GOOGLE_GENERATIVE_AI_API_KEY`
+- model: `gemini-2.5-flash-native-audio-preview-12-2025`
+- voice: `Kore`
+
+Example:
+
+```json5
+{
+  plugins: {
+    entries: {
+      "voice-call": {
+        config: {
+          provider: "twilio",
+          inboundPolicy: "allowlist",
+          allowFrom: ["+15550005678"],
+          realtime: {
+            enabled: true,
+            provider: "google",
+            instructions: "Speak briefly and ask before using tools.",
+            providers: {
+              google: {
+                apiKey: "${GEMINI_API_KEY}",
+                model: "gemini-2.5-flash-native-audio-preview-12-2025",
+                voice: "Kore",
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+}
+```
+
+Use OpenAI instead:
+
+```json5
+{
+  plugins: {
+    entries: {
+      "voice-call": {
+        config: {
+          realtime: {
+            enabled: true,
+            provider: "openai",
+            providers: {
+              openai: {
+                apiKey: "${OPENAI_API_KEY}",
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+}
+```
+
+See [Google provider](/providers/google) and [OpenAI provider](/providers/openai)
+for provider-specific realtime voice options.
+
+## Streaming transcription
+
+`streaming` selects a realtime transcription provider for live call audio.
+
+Current runtime behavior:
+
+- `streaming.provider` is optional. If unset, Voice Call uses the first
+  registered realtime transcription provider.
+- Bundled realtime transcription providers include Deepgram (`deepgram`),
+  ElevenLabs (`elevenlabs`), Mistral (`mistral`), OpenAI (`openai`), and xAI
+  (`xai`), registered by their provider plugins.
+- Provider-owned raw config lives under `streaming.providers.<providerId>`.
+- If `streaming.provider` points at an unregistered provider, or no realtime
+  transcription provider is registered at all, Voice Call logs a warning and
+  skips media streaming instead of failing the whole plugin.
+
+OpenAI streaming transcription defaults:
+
+- API key: `streaming.providers.openai.apiKey` or `OPENAI_API_KEY`
+- model: `gpt-4o-transcribe`
+- `silenceDurationMs`: `800`
+- `vadThreshold`: `0.5`
+
+xAI streaming transcription defaults:
+
+- API key: `streaming.providers.xai.apiKey` or `XAI_API_KEY`
+- endpoint: `wss://api.x.ai/v1/stt`
+- `encoding`: `mulaw`
+- `sampleRate`: `8000`
+- `endpointingMs`: `800`
+- `interimResults`: `true`
+
+Example:
+
+```json5
+{
+  plugins: {
+    entries: {
+      "voice-call": {
+        config: {
+          streaming: {
+            enabled: true,
+            provider: "openai",
+            streamPath: "/voice/stream",
+            providers: {
+              openai: {
+                apiKey: "sk-...", // optional if OPENAI_API_KEY is set
+                model: "gpt-4o-transcribe",
+                silenceDurationMs: 800,
+                vadThreshold: 0.5,
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+}
+```
+
+Use xAI instead:
+
+```json5
+{
+  plugins: {
+    entries: {
+      "voice-call": {
+        config: {
+          streaming: {
+            enabled: true,
+            provider: "xai",
+            streamPath: "/voice/stream",
+            providers: {
+              xai: {
+                apiKey: "${XAI_API_KEY}", // optional if XAI_API_KEY is set
+                endpointingMs: 800,
+                language: "en",
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+}
+```
+
+Legacy keys are still auto-migrated by `openclaw doctor --fix`:
+
+- `streaming.sttProvider` → `streaming.provider`
+- `streaming.openaiApiKey` → `streaming.providers.openai.apiKey`
+- `streaming.sttModel` → `streaming.providers.openai.model`
+- `streaming.silenceDurationMs` → `streaming.providers.openai.silenceDurationMs`
+- `streaming.vadThreshold` → `streaming.providers.openai.vadThreshold`
 
 ## Stale call reaper
 
@@ -219,9 +420,11 @@ streaming speech on calls. You can override it under the plugin config with the
 {
   tts: {
     provider: "elevenlabs",
-    elevenlabs: {
-      voiceId: "pMsXgVXv3BLzUgSXRplE",
-      modelId: "eleven_multilingual_v2",
+    providers: {
+      elevenlabs: {
+        voiceId: "pMsXgVXv3BLzUgSXRplE",
+        modelId: "eleven_multilingual_v2",
+      },
     },
   },
 }
@@ -229,9 +432,11 @@ streaming speech on calls. You can override it under the plugin config with the
 
 Notes:
 
+- Legacy `tts.<provider>` keys inside plugin config (`openai`, `elevenlabs`, `microsoft`, `edge`) are auto-migrated to `tts.providers.<provider>` on load. Prefer the `providers` shape in committed config.
 - **Microsoft speech is ignored for voice calls** (telephony audio needs PCM; the current Microsoft transport does not expose telephony PCM output).
 - Core TTS is used when Twilio media streaming is enabled; otherwise calls fall back to provider native voices.
 - If a Twilio media stream is already active, Voice Call does not fall back to TwiML `<Say>`. If telephony TTS is unavailable in that state, the playback request fails instead of mixing two playback paths.
+- When telephony TTS falls back to a secondary provider, Voice Call logs a warning with the provider chain (`from`, `to`, `attempts`) for debugging.
 
 ### More examples
 
@@ -242,7 +447,9 @@ Use core TTS only (no override):
   messages: {
     tts: {
       provider: "openai",
-      openai: { voice: "alloy" },
+      providers: {
+        openai: { voice: "alloy" },
+      },
     },
   },
 }
@@ -258,10 +465,12 @@ Override to ElevenLabs just for calls (keep core default elsewhere):
         config: {
           tts: {
             provider: "elevenlabs",
-            elevenlabs: {
-              apiKey: "elevenlabs_key",
-              voiceId: "pMsXgVXv3BLzUgSXRplE",
-              modelId: "eleven_multilingual_v2",
+            providers: {
+              elevenlabs: {
+                apiKey: "elevenlabs_key",
+                voiceId: "pMsXgVXv3BLzUgSXRplE",
+                modelId: "eleven_multilingual_v2",
+              },
             },
           },
         },
@@ -280,9 +489,11 @@ Override only the OpenAI model for calls (deep‑merge example):
       "voice-call": {
         config: {
           tts: {
-            openai: {
-              model: "gpt-4o-mini-tts",
-              voice: "marin",
+            providers: {
+              openai: {
+                model: "gpt-4o-mini-tts",
+                voice: "marin",
+              },
             },
           },
         },
@@ -352,6 +563,7 @@ openclaw voicecall call --to "+15555550123" --message "Hello from OpenClaw"
 openclaw voicecall start --to "+15555550123"   # alias for call
 openclaw voicecall continue --call-id <id> --message "Any questions?"
 openclaw voicecall speak --call-id <id> --message "One moment"
+openclaw voicecall dtmf --call-id <id> --digits "ww123456#"
 openclaw voicecall end --call-id <id>
 openclaw voicecall status --call-id <id>
 openclaw voicecall tail
@@ -373,6 +585,7 @@ Actions:
 - `initiate_call` (message, to?, mode?)
 - `continue_call` (callId, message)
 - `speak_to_user` (callId, message)
+- `send_dtmf` (callId, digits)
 - `end_call` (callId)
 - `get_status` (callId)
 
@@ -383,5 +596,12 @@ This repo ships a matching skill doc at `skills/voice-call/SKILL.md`.
 - `voicecall.initiate` (`to?`, `message`, `mode?`)
 - `voicecall.continue` (`callId`, `message`)
 - `voicecall.speak` (`callId`, `message`)
+- `voicecall.dtmf` (`callId`, `digits`)
 - `voicecall.end` (`callId`)
 - `voicecall.status` (`callId`)
+
+## Related
+
+- [Text-to-speech](/tools/tts)
+- [Talk mode](/nodes/talk)
+- [Voice wake](/nodes/voicewake)

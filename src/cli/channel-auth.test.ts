@@ -11,9 +11,11 @@ const mocks = vi.hoisted(() => ({
   listChannelPlugins: vi.fn(),
   normalizeChannelId: vi.fn(),
   loadConfig: vi.fn(),
+  readConfigFileSnapshot: vi.fn(),
   applyPluginAutoEnable: vi.fn(),
-  writeConfigFile: vi.fn(),
+  replaceConfigFile: vi.fn(),
   setVerbose: vi.fn(),
+  callGateway: vi.fn(),
   createClackPrompter: vi.fn(),
   ensureChannelSetupPluginInstalled: vi.fn(),
   loadChannelSetupPluginRegistrySnapshotForChannel: vi.fn(),
@@ -44,7 +46,8 @@ vi.mock("../channels/plugins/index.js", () => ({
 
 vi.mock("../config/config.js", () => ({
   loadConfig: mocks.loadConfig,
-  writeConfigFile: mocks.writeConfigFile,
+  readConfigFileSnapshot: mocks.readConfigFileSnapshot,
+  replaceConfigFile: mocks.replaceConfigFile,
 }));
 
 vi.mock("../config/plugin-auto-enable.js", () => ({
@@ -53,6 +56,10 @@ vi.mock("../config/plugin-auto-enable.js", () => ({
 
 vi.mock("../globals.js", () => ({
   setVerbose: mocks.setVerbose,
+}));
+
+vi.mock("../gateway/call.js", () => ({
+  callGateway: mocks.callGateway,
 }));
 
 vi.mock("../wizard/clack-prompter.js", () => ({
@@ -70,7 +77,7 @@ describe("channel-auth", () => {
   const plugin = {
     id: "whatsapp",
     auth: { login: mocks.login },
-    gateway: { logoutAccount: mocks.logoutAccount },
+    gateway: { startAccount: vi.fn(), logoutAccount: mocks.logoutAccount },
     config: {
       listAccountIds: vi.fn().mockReturnValue(["default"]),
       resolveAccount: mocks.resolveAccount,
@@ -84,8 +91,10 @@ describe("channel-auth", () => {
     mocks.getChannelPluginCatalogEntry.mockReturnValue(undefined);
     mocks.listChannelPluginCatalogEntries.mockReturnValue([]);
     mocks.loadConfig.mockReturnValue({ channels: { whatsapp: {} } });
+    mocks.readConfigFileSnapshot.mockResolvedValue({ hash: "config-1" });
     mocks.applyPluginAutoEnable.mockImplementation(({ config }) => ({ config, changes: [] }));
-    mocks.writeConfigFile.mockResolvedValue(undefined);
+    mocks.replaceConfigFile.mockResolvedValue(undefined);
+    mocks.callGateway.mockResolvedValue({ ok: true });
     mocks.listChannelPlugins.mockReturnValue([plugin]);
     mocks.resolveDefaultAgentId.mockReturnValue("main");
     mocks.resolveAgentWorkspaceDir.mockReturnValue("/tmp/workspace");
@@ -118,6 +127,41 @@ describe("channel-auth", () => {
         verbose: true,
         channelInput: "wa",
       }),
+    );
+    expect(mocks.callGateway).toHaveBeenCalledWith({
+      config: { channels: { whatsapp: {} } },
+      method: "channels.start",
+      params: {
+        channel: "whatsapp",
+        accountId: "acct-1",
+      },
+      mode: "backend",
+      clientName: "gateway-client",
+      deviceIdentity: null,
+    });
+  });
+
+  it("skips gateway runtime reconcile in remote mode and warns without failing login", async () => {
+    mocks.loadConfig.mockReturnValue({
+      gateway: { mode: "remote" },
+      channels: { whatsapp: {} },
+    });
+
+    await runChannelLogin({ channel: "whatsapp", account: "acct-1" }, runtime);
+
+    expect(mocks.callGateway).not.toHaveBeenCalled();
+    expect(runtime.log).toHaveBeenCalledWith(expect.stringContaining("Gateway is in remote mode"));
+  });
+
+  it("keeps login successful when local gateway runtime reconcile fails", async () => {
+    mocks.callGateway.mockRejectedValue(new Error("gateway unreachable"));
+
+    await expect(
+      runChannelLogin({ channel: "whatsapp", account: "acct-1" }, runtime),
+    ).resolves.toBeUndefined();
+
+    expect(runtime.log).toHaveBeenCalledWith(
+      expect.stringContaining("running gateway did not restart it: gateway unreachable"),
     );
   });
 
@@ -158,7 +202,10 @@ describe("channel-auth", () => {
         channelInput: "whatsapp",
       }),
     );
-    expect(mocks.writeConfigFile).toHaveBeenCalledWith(autoEnabledCfg);
+    expect(mocks.replaceConfigFile).toHaveBeenCalledWith({
+      nextConfig: autoEnabledCfg,
+      baseHash: "config-1",
+    });
   });
 
   it("persists auto-enabled config during logout auto-pick too", async () => {
@@ -173,7 +220,10 @@ describe("channel-auth", () => {
         cfg: autoEnabledCfg,
       }),
     );
-    expect(mocks.writeConfigFile).toHaveBeenCalledWith(autoEnabledCfg);
+    expect(mocks.replaceConfigFile).toHaveBeenCalledWith({
+      nextConfig: autoEnabledCfg,
+      baseHash: "config-1",
+    });
   });
 
   it("ignores configured channels that do not support login when channel is omitted", async () => {
@@ -304,7 +354,10 @@ describe("channel-auth", () => {
         workspaceDir: "/tmp/workspace",
       }),
     );
-    expect(mocks.writeConfigFile).toHaveBeenCalledWith({ channels: { whatsapp: {} } });
+    expect(mocks.replaceConfigFile).toHaveBeenCalledWith({
+      nextConfig: { channels: { whatsapp: {} } },
+      baseHash: "config-1",
+    });
     expect(mocks.login).toHaveBeenCalled();
   });
 

@@ -1,12 +1,17 @@
 import type { FinalizedMsgContext } from "../auto-reply/templating.js";
-import type { OpenClawConfig } from "../config/config.js";
+import { getChannelPlugin, normalizeChannelId } from "../channels/plugins/index.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type {
   PluginHookInboundClaimContext,
   PluginHookInboundClaimEvent,
   PluginHookMessageContext,
   PluginHookMessageReceivedEvent,
   PluginHookMessageSentEvent,
-} from "../plugins/types.js";
+} from "../plugins/hook-message.types.js";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "../shared/string-coerce.js";
 import type {
   MessagePreprocessedHookContext,
   MessageReceivedHookContext,
@@ -33,9 +38,13 @@ export type CanonicalInboundMessageHookContext = {
   provider?: string;
   surface?: string;
   threadId?: string | number;
+  // `mediaPath(s)` are files OpenClaw has already staged locally. `mediaUrl(s)`
+  // are provider/media-server references that may not exist on this host.
   mediaPath?: string;
+  mediaUrl?: string;
   mediaType?: string;
   mediaPaths?: string[];
+  mediaUrls?: string[];
   mediaTypes?: string[];
   originatingChannel?: string;
   originatingTo?: string;
@@ -43,6 +52,7 @@ export type CanonicalInboundMessageHookContext = {
   channelName?: string;
   isGroup: boolean;
   groupId?: string;
+  topicName?: string;
 };
 
 export type CanonicalSentMessageHookContext = {
@@ -74,7 +84,9 @@ export function deriveInboundMessageHookContext(
         : typeof ctx.Body === "string"
           ? ctx.Body
           : "");
-  const channelId = (ctx.OriginatingChannel ?? ctx.Surface ?? ctx.Provider ?? "").toLowerCase();
+  const channelId = normalizeLowercaseStringOrEmpty(
+    ctx.OriginatingChannel ?? ctx.Surface ?? ctx.Provider ?? "",
+  );
   const conversationId = ctx.OriginatingTo ?? ctx.To ?? ctx.From ?? undefined;
   const isGroup = Boolean(ctx.GroupSubject || ctx.GroupChannel);
   const mediaPaths = Array.isArray(ctx.MediaPaths)
@@ -84,6 +96,11 @@ export function deriveInboundMessageHookContext(
     : undefined;
   const mediaTypes = Array.isArray(ctx.MediaTypes)
     ? ctx.MediaTypes.filter(
+        (value): value is string => typeof value === "string" && value.length > 0,
+      )
+    : undefined;
+  const mediaUrls = Array.isArray(ctx.MediaUrls)
+    ? ctx.MediaUrls.filter(
         (value): value is string => typeof value === "string" && value.length > 0,
       )
     : undefined;
@@ -115,8 +132,10 @@ export function deriveInboundMessageHookContext(
     surface: ctx.Surface,
     threadId: ctx.MessageThreadId,
     mediaPath: ctx.MediaPath ?? mediaPaths?.[0],
+    mediaUrl: ctx.MediaUrl ?? mediaUrls?.[0],
     mediaType: ctx.MediaType ?? mediaTypes?.[0],
     mediaPaths,
+    mediaUrls,
     mediaTypes,
     originatingChannel: ctx.OriginatingChannel,
     originatingTo: ctx.OriginatingTo,
@@ -124,6 +143,7 @@ export function deriveInboundMessageHookContext(
     channelName: ctx.GroupChannel,
     isGroup,
     groupId: isGroup ? conversationId : undefined,
+    topicName: ctx.TopicName,
   };
 }
 
@@ -177,74 +197,42 @@ function stripChannelPrefix(value: string | undefined, channelId: string): strin
   return value.startsWith(prefix) ? value.slice(prefix.length) : value;
 }
 
-function deriveParentConversationId(
-  canonical: CanonicalInboundMessageHookContext,
-): string | undefined {
-  if (canonical.channelId !== "telegram") {
-    return undefined;
-  }
-  if (typeof canonical.threadId !== "number" && typeof canonical.threadId !== "string") {
-    return undefined;
-  }
-  return stripChannelPrefix(
-    canonical.to ?? canonical.originatingTo ?? canonical.conversationId,
-    "telegram",
-  );
-}
-
-function deriveConversationId(canonical: CanonicalInboundMessageHookContext): string | undefined {
-  if (canonical.channelId === "discord") {
-    const rawTarget = canonical.to ?? canonical.originatingTo ?? canonical.conversationId;
-    const rawSender = canonical.from;
-    const senderUserId = rawSender?.startsWith("discord:user:")
-      ? rawSender.slice("discord:user:".length)
-      : rawSender?.startsWith("discord:")
-        ? rawSender.slice("discord:".length)
-        : undefined;
-    if (!canonical.isGroup && senderUserId) {
-      return `user:${senderUserId}`;
-    }
-    if (!rawTarget) {
-      return undefined;
-    }
-    if (rawTarget.startsWith("discord:channel:")) {
-      return `channel:${rawTarget.slice("discord:channel:".length)}`;
-    }
-    if (rawTarget.startsWith("discord:user:")) {
-      return `user:${rawTarget.slice("discord:user:".length)}`;
-    }
-    if (rawTarget.startsWith("discord:")) {
-      return `user:${rawTarget.slice("discord:".length)}`;
-    }
-    if (rawTarget.startsWith("channel:") || rawTarget.startsWith("user:")) {
-      return rawTarget;
-    }
+function resolveInboundConversation(canonical: CanonicalInboundMessageHookContext): {
+  conversationId?: string;
+  parentConversationId?: string;
+} {
+  const channelId = normalizeChannelId(canonical.channelId);
+  const pluginResolved = channelId
+    ? getChannelPlugin(channelId)?.messaging?.resolveInboundConversation?.({
+        from: canonical.from,
+        to: canonical.to ?? canonical.originatingTo,
+        conversationId: canonical.conversationId,
+        threadId: canonical.threadId,
+        isGroup: canonical.isGroup,
+      })
+    : null;
+  if (pluginResolved) {
+    return {
+      conversationId: normalizeOptionalString(pluginResolved.conversationId),
+      parentConversationId: normalizeOptionalString(pluginResolved.parentConversationId),
+    };
   }
   const baseConversationId = stripChannelPrefix(
     canonical.to ?? canonical.originatingTo ?? canonical.conversationId,
     canonical.channelId,
   );
-  if (canonical.channelId === "telegram" && baseConversationId) {
-    const threadId =
-      typeof canonical.threadId === "number" || typeof canonical.threadId === "string"
-        ? String(canonical.threadId).trim()
-        : "";
-    if (threadId) {
-      return `${baseConversationId}:topic:${threadId}`;
-    }
-  }
-  return baseConversationId;
+  return { conversationId: baseConversationId };
 }
 
 export function toPluginInboundClaimContext(
   canonical: CanonicalInboundMessageHookContext,
 ): PluginHookInboundClaimContext {
-  const conversationId = deriveConversationId(canonical);
+  const conversation = resolveInboundConversation(canonical);
   return {
     channelId: canonical.channelId,
     accountId: canonical.accountId,
-    conversationId,
-    parentConversationId: deriveParentConversationId(canonical),
+    conversationId: conversation.conversationId,
+    parentConversationId: conversation.parentConversationId,
     senderId: canonical.senderId,
     messageId: canonical.messageId,
   };
@@ -285,12 +273,15 @@ export function toPluginInboundClaimEvent(
       originatingTo: canonical.originatingTo,
       senderE164: canonical.senderE164,
       mediaPath: canonical.mediaPath,
+      mediaUrl: canonical.mediaUrl,
       mediaType: canonical.mediaType,
       mediaPaths: canonical.mediaPaths,
+      mediaUrls: canonical.mediaUrls,
       mediaTypes: canonical.mediaTypes,
       guildId: canonical.guildId,
       channelName: canonical.channelName,
       groupId: canonical.groupId,
+      topicName: canonical.topicName,
     },
   };
 }
@@ -302,6 +293,7 @@ export function toPluginMessageReceivedEvent(
     from: canonical.from,
     content: canonical.content,
     timestamp: canonical.timestamp,
+    threadId: canonical.threadId,
     metadata: {
       to: canonical.to,
       provider: canonical.provider,
@@ -316,6 +308,7 @@ export function toPluginMessageReceivedEvent(
       senderE164: canonical.senderE164,
       guildId: canonical.guildId,
       channelName: canonical.channelName,
+      topicName: canonical.topicName,
     },
   };
 }
@@ -353,6 +346,7 @@ export function toInternalMessageReceivedContext(
       senderE164: canonical.senderE164,
       guildId: canonical.guildId,
       channelName: canonical.channelName,
+      topicName: canonical.topicName,
     },
   };
 }
